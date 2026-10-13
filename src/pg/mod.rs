@@ -80,6 +80,10 @@ const FAKE_OID: u32 = 0;
 /// In both cases, the PostgreSQL server is executing the queries **sequentially** - pipelining just allows both sides of
 /// the connection to work concurrently when possible.
 ///
+/// Requests are sent in the order their futures are first polled, so the server also executes
+/// them in that order. A combinator that polls its futures in a fixed order on the first poll
+/// (like `futures_util::try_join!`) therefore runs dependent statements in that order.
+///
 /// Pipelining happens automatically when futures are polled concurrently (for example, by using the futures `join`
 /// combinator):
 ///
@@ -608,6 +612,11 @@ impl AsyncPgConnection {
             let res = async {
             let is_safe_to_cache_prepared = is_safe_to_cache_prepared?;
             collect_bind_result?;
+            // Take the statement cache lock before anything below can suspend. Futures polled
+            // concurrently on one connection (pipelining) then send their requests in the order
+            // they were first polled: resolving custom type OIDs can await a lookup query, and
+            // without the lock a later statement that needs no lookup would overtake this one.
+            let mut stmt_cache = stmt_cache.lock().await;
             // Check whether we need to resolve some types at all
             //
             // If the user doesn't use custom types there is no need
@@ -662,7 +671,6 @@ impl AsyncPgConnection {
                 }
             }
             let stmt = {
-                let mut stmt_cache = stmt_cache.lock().await;
                 let helper = QueryFragmentHelper {
                     sql: sql.clone(),
                     safe_to_cache: is_safe_to_cache_prepared,
@@ -687,6 +695,8 @@ impl AsyncPgConnection {
                     .0
                     .clone()
             };
+            // Released before the request is sent; nothing between here and the send awaits.
+            drop(stmt_cache);
 
             let binds = bind_collector
                 .metadata
