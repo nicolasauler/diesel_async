@@ -225,7 +225,7 @@ impl AsyncConnectionCore for AsyncPgConnection {
         T::Query: QueryFragment<Self::Backend> + QueryId + 'query,
     {
         let query = source.as_query();
-        let load_future = self.with_prepared_statement(query, load_prepared, load_unprepared);
+        let load_future = self.with_prepared_statement(query, load_prepared, prepare_first());
 
         self.run_with_connection_future(load_future)
     }
@@ -237,7 +237,8 @@ impl AsyncConnectionCore for AsyncPgConnection {
     where
         T: QueryFragment<Self::Backend> + QueryId + 'query,
     {
-        let execute = self.with_prepared_statement(source, execute_prepared, execute_unprepared);
+        let execute =
+            self.with_prepared_statement(source, execute_prepared, Some(execute_unprepared));
         self.run_with_connection_future(execute)
     }
 }
@@ -257,7 +258,7 @@ impl<'a> AsyncConnectionCore for &'a AsyncPgConnection {
         T::Query: QueryFragment<Self::Backend> + QueryId + 'query,
     {
         let query = source.as_query();
-        let load_future = self.with_prepared_statement(query, load_prepared, load_unprepared);
+        let load_future = self.with_prepared_statement(query, load_prepared, prepare_first());
 
         self.run_with_connection_future(load_future)
     }
@@ -269,7 +270,8 @@ impl<'a> AsyncConnectionCore for &'a AsyncPgConnection {
     where
         T: QueryFragment<Self::Backend> + QueryId + 'query,
     {
-        let execute = self.with_prepared_statement(source, execute_prepared, execute_unprepared);
+        let execute =
+            self.with_prepared_statement(source, execute_prepared, Some(execute_unprepared));
         self.run_with_connection_future(execute)
     }
 }
@@ -370,25 +372,26 @@ async fn execute_prepared(
         .map_err(|e| diesel::result::Error::DeserializationError(Box::new(e)))
 }
 
-// Statements Diesel will not cache (every UPDATE, upserts, raw SQL, …) are sent as one unnamed
-// Parse/Bind/Execute, as libpq's `PQsendQueryParams` does for the sync connection: one round trip,
-// where preparing them first costs a Parse round trip, an execute round trip and a Close.
-async fn load_unprepared(
-    conn: &tokio_postgres::Client,
-    sql: String,
-    binds: Vec<(ToSqlHelper, Type)>,
-) -> QueryResult<BoxStream<'static, QueryResult<PgRow>>> {
-    let res = conn
-        .query_typed_raw(&sql, binds)
-        .await
-        .map_err(ErrorHelper)?;
-
-    Ok(res
-        .map_err(|e| diesel::result::Error::from(ErrorHelper(e)))
-        .map_ok(PgRow::new)
-        .boxed())
+// Loads have no unprepared path. tokio-postgres resolves the custom types of an unnamed
+// statement's row description only after sending the statement, so on a connection that has not
+// seen those types yet the lookup query would run after the statement itself: it would report
+// `current transaction is aborted` in place of the statement's own error, and a large result
+// could fill the response channel the lookup's answer waits behind. Preparing first resolves the
+// types before anything executes.
+fn prepare_first<'a, R>() -> Option<
+    fn(
+        &'a tokio_postgres::Client,
+        String,
+        Vec<(ToSqlHelper, Type)>,
+    ) -> std::future::Ready<QueryResult<R>>,
+> {
+    None
 }
 
+// Statements Diesel will not cache (every UPDATE, upserts, raw SQL, …) that return no rows are
+// sent as one unnamed Parse/Bind/Execute, as libpq's `PQsendQueryParams` does for the sync
+// connection: one round trip, where preparing them first costs a Parse round trip, an execute
+// round trip and a Close. `execute_typed` reads past any row description without resolving types.
 async fn execute_unprepared(
     conn: &tokio_postgres::Client,
     sql: String,
@@ -588,7 +591,7 @@ impl AsyncPgConnection {
         &'a self,
         query: T,
         callback: fn(&'a tokio_postgres::Client, Statement, Vec<ToSqlHelper>) -> F,
-        unprepared: fn(&'a tokio_postgres::Client, String, Vec<(ToSqlHelper, Type)>) -> G,
+        unprepared: Option<fn(&'a tokio_postgres::Client, String, Vec<(ToSqlHelper, Type)>) -> G>,
     ) -> BoxFuture<'a, QueryResult<R>>
     where
         T: QueryFragment<diesel::pg::Pg> + QueryId,
@@ -629,7 +632,7 @@ impl AsyncPgConnection {
     fn with_prepared_statement_after_sql_built<'a, F, G, R>(
         &'a self,
         callback: fn(&'a tokio_postgres::Client, Statement, Vec<ToSqlHelper>) -> F,
-        unprepared: fn(&'a tokio_postgres::Client, String, Vec<(ToSqlHelper, Type)>) -> G,
+        unprepared: Option<fn(&'a tokio_postgres::Client, String, Vec<(ToSqlHelper, Type)>) -> G>,
         is_safe_to_cache_prepared: QueryResult<bool>,
         query_id: Option<std::any::TypeId>,
         to_sql_result: QueryResult<()>,
@@ -716,7 +719,7 @@ impl AsyncPgConnection {
                         })?;
                 }
             }
-            if !is_safe_to_cache_prepared {
+            if let (false, Some(unprepared)) = (is_safe_to_cache_prepared, unprepared) {
                 let binds = bind_collector
                     .metadata
                     .into_iter()
